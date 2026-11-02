@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS quota_log (ts REAL, ops INTEGER, kind TEXT);
 CREATE TABLE IF NOT EXISTS search_ads (ad_group_ad TEXT PRIMARY KEY, ad TEXT, campaign TEXT,
   urls TEXT, mobile TEXT, status TEXT DEFAULT 'todo', attempts INTEGER DEFAULT 0, error TEXT);
+CREATE TABLE IF NOT EXISTS items (res TEXT PRIMARY KEY, kind TEXT, check_res TEXT, label TEXT,
+  fields TEXT, status TEXT DEFAULT 'todo', attempts INTEGER DEFAULT 0, error TEXT);
 """
 
 

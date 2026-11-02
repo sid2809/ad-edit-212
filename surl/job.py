@@ -1,14 +1,16 @@
-"""Search campaigns: ad final URLs ponly.com/cook/<slug> -> ponly.com/cooks/<slug>
-(Siddharth, 2 Nov 2026). Nothing else changes; campaign names stay.
+"""ponly.com/cook -> ponly.com/cooks wherever it appears (Siddharth, 2 Nov 2026:
+"Change wherever the ponly.com/cook comes to ponly.com/cooks"). Campaign names are not changed
+(his earlier instruction); the scan counts them.
 
-1. Scan (read-only, once, when 'Run scan' is TRUE): every ad, keyword, asset and tracking
-   template whose URL contains ponly.com/cook/, written to the 'Scan' tab. Ads with the old
-   path in another form (e.g. http://www.) are listed and never changed.
-2. Update (when 'Run update' is TRUE, after the scan): each ad's final URL (and final mobile
-   URL if it has the old path) is changed in place (AdService; the update mask names only
-   those fields), then the ad is read back from Google: only a read-back showing the new URL
-   counts. Up to 3 tries per ad; sized to this tool's daily cap; continues on later loops.
-   Keywords / assets / templates are reported by the scan but not changed."""
+1. Scan (read-only, once, when 'Run scan' is TRUE): every ad (all types) and every asset (e.g.
+   sitelinks) whose final URL, final mobile URL, tracking template or final URL suffix contains
+   ponly.com/cook (any scheme, www, letter case). Also counts campaigns / ad groups / keywords /
+   the account itself with it in their URL fields or templates, and campaign names containing it.
+   Result in the 'Scan' tab.
+2. Update (when 'Run update' is TRUE, after the scan): each queued ad (AdService) and asset
+   (AssetService) is changed in place; the update mask names only the fields that had the old
+   path. Then it is read back from Google: only a read-back showing the new values counts. Up to
+   3 tries each; sized to this tool's daily cap; continues on later loops."""
 import json
 import re
 import time
@@ -16,6 +18,11 @@ import time
 from . import config, db
 from .ads import QuotaExhausted, partial_failures, quota_kind
 from .log import short
+
+SCAN_KEY, UPDATE_KEY = "scan_v2", "update_v2"
+# (proto field, GAQL field suffix); lists are repeated fields
+AD_FIELDS = (("final_urls", True), ("final_mobile_urls", True),
+             ("tracking_url_template", False), ("final_url_suffix", False))
 
 
 def account(settings):
@@ -31,10 +38,6 @@ def _chunks(seq, n=200):
     seq = list(seq)
     for i in range(0, len(seq), n):
         yield seq[i:i + n]
-
-
-def _has_old(urls):
-    return any(config.OLD_PATH in (u or "") for u in urls)
 
 
 def _search(w, cid, query):
@@ -55,172 +58,254 @@ def _search(w, cid, query):
     return rows
 
 
+def _values(obj):
+    """{field: current value} for the URL fields of an ad or asset."""
+    out = {}
+    for f, rep in AD_FIELDS:
+        v = getattr(obj, f, None)
+        out[f] = list(v or []) if rep else (v or "")
+    return out
+
+
+def _changes(vals):
+    """{field: new value} only for fields that contain the old path."""
+    out = {}
+    for f, rep in AD_FIELDS:
+        v = vals.get(f)
+        if rep and any(config.has_old(u) for u in v or []):
+            out[f] = [config.rewrite_url(u) for u in v]
+        elif not rep and config.has_old(v):
+            out[f] = config.rewrite_url(v)
+    return out
+
+
+def _sel(prefix):
+    return ", ".join(f"{prefix}.{f}" for f, _ in AD_FIELDS)
+
+
+def _count(d, k):
+    d[k] = d.get(k, 0) + 1
+
+
 def scan(w, cid):
     con = w.con
-    ads = _search(w, cid, "SELECT campaign.id, campaign.name, ad_group.id, "
-                          "ad_group_ad.resource_name, ad_group_ad.ad.id, ad_group_ad.ad.type, "
-                          "ad_group_ad.ad.final_urls, ad_group_ad.ad.final_mobile_urls FROM "
-                          "ad_group_ad WHERE ad_group_ad.status != 'REMOVED' AND "
-                          "campaign.status != 'REMOVED'")
+    ads = _search(w, cid, "SELECT campaign.id, campaign.name, campaign.advertising_channel_type, "
+                          "ad_group.id, ad_group_ad.resource_name, ad_group_ad.ad.id, "
+                          f"ad_group_ad.ad.type, {_sel('ad_group_ad.ad')} FROM ad_group_ad "
+                          "WHERE ad_group_ad.status != 'REMOVED' AND campaign.status != 'REMOVED'")
+    assets = _search(w, cid, f"SELECT asset.resource_name, asset.type, asset.name, "
+                             f"{_sel('asset')} FROM asset")
     kws = _search(w, cid, "SELECT ad_group_criterion.final_urls, "
-                          "ad_group_criterion.final_mobile_urls FROM ad_group_criterion WHERE "
+                          "ad_group_criterion.final_mobile_urls, "
+                          "ad_group_criterion.tracking_url_template, "
+                          "ad_group_criterion.final_url_suffix FROM ad_group_criterion WHERE "
                           "ad_group_criterion.status != 'REMOVED' AND "
                           "ad_group_criterion.type = 'KEYWORD'")
-    assets = _search(w, cid, "SELECT asset.type, asset.final_urls, asset.final_mobile_urls "
-                             "FROM asset")
-    camps = _search(w, cid, "SELECT campaign.tracking_url_template, campaign.final_url_suffix "
+    camps = _search(w, cid, "SELECT campaign.id, campaign.name, campaign.advertising_channel_type, "
+                            "campaign.tracking_url_template, campaign.final_url_suffix "
                             "FROM campaign WHERE campaign.status != 'REMOVED'")
     groups = _search(w, cid, "SELECT ad_group.tracking_url_template, ad_group.final_url_suffix "
                              "FROM ad_group WHERE ad_group.status != 'REMOVED'")
-    per_camp, per_ag, types, multi = {}, {}, {}, 0
-    queue, odd = [], []
+    cust = _search(w, cid, "SELECT customer.tracking_url_template, customer.final_url_suffix "
+                           "FROM customer")
+
+    per_camp, names, types, q_types, q_channels = {}, {}, {}, {}, {}
+    queue = []
     for x in ads:
         aga = x.ad_group_ad
+        names[x.campaign.id] = x.campaign.name
         per_camp[x.campaign.id] = per_camp.get(x.campaign.id, 0) + 1
-        per_ag[x.ad_group.id] = per_ag.get(x.ad_group.id, 0) + 1
-        t = aga.ad.type_.name
-        types[t] = types.get(t, 0) + 1
-        urls, mob = list(aga.ad.final_urls), list(aga.ad.final_mobile_urls)
-        if len(urls) > 1:
-            multi += 1
-        if not (_has_old(urls) or _has_old(mob)):
+        _count(types, aga.ad.type_.name)
+        vals = _values(aga.ad)
+        ch = _changes(vals)
+        if not ch:
             continue
-        if any(config.rewrite_url(u) == u for u in urls + mob if config.OLD_PATH in (u or "")):
-            odd.append([x.campaign.name, urls + mob])
-            continue
-        queue.append((aga.resource_name, f"customers/{cid}/ads/{aga.ad.id}", x.campaign.name,
-                      urls, mob))
-    kw_old = sum(1 for x in kws if _has_old(x.ad_group_criterion.final_urls) or
-                 _has_old(x.ad_group_criterion.final_mobile_urls))
-    asset_old = {}
+        _count(q_types, aga.ad.type_.name)
+        _count(q_channels, x.campaign.advertising_channel_type.name)
+        queue.append((f"customers/{cid}/ads/{aga.ad.id}", "ad", aga.resource_name,
+                      x.campaign.name, {f: [vals[f], ch[f]] for f in ch}))
+    a_types = {}
     for x in assets:
-        if _has_old(x.asset.final_urls) or _has_old(x.asset.final_mobile_urls):
-            asset_old[x.asset.type_.name] = asset_old.get(x.asset.type_.name, 0) + 1
-    tpl_old = sum(1 for x in camps if config.OLD_PATH in (x.campaign.tracking_url_template or "")
-                  + (x.campaign.final_url_suffix or ""))
-    tpl_old += sum(1 for x in groups if config.OLD_PATH in
-                   (x.ad_group.tracking_url_template or "") + (x.ad_group.final_url_suffix or ""))
+        vals = _values(x.asset)
+        ch = _changes(vals)
+        if not ch:
+            continue
+        _count(a_types, x.asset.type_.name)
+        queue.append((x.asset.resource_name, "asset", x.asset.resource_name,
+                      f"{x.asset.type_.name} {x.asset.name}".strip(),
+                      {f: [vals[f], ch[f]] for f in ch}))
+    camp_channels = {}
+    for x in camps:
+        _count(camp_channels, x.campaign.advertising_channel_type.name)
+        names.setdefault(x.campaign.id, x.campaign.name)
+
+    def tpl_hits(rows, attr):
+        n = 0
+        for r in rows:
+            o = getattr(r, attr)
+            if any(config.has_old(getattr(o, f, "") or "") for f in
+                   ("tracking_url_template", "final_url_suffix")):
+                n += 1
+        return n
+    kw_old = sum(1 for x in kws if _changes(_values(x.ad_group_criterion)))
+    not_one = sorted(((names.get(c, str(c)), n) for c, n in per_camp.items() if n != 1),
+                     key=lambda t: -t[1])
+    no_ads = [x.campaign.name for x in camps if x.campaign.id not in per_camp]
     with db.tx(con):
-        con.execute("DELETE FROM search_ads WHERE status!='done'")
-        for aga, ad, name, urls, mob in queue:
-            con.execute("INSERT OR IGNORE INTO search_ads(ad_group_ad, ad, campaign, urls, mobile)"
-                        " VALUES(?,?,?,?,?)", (aga, ad, name, json.dumps(urls), json.dumps(mob)))
+        con.execute("DELETE FROM items WHERE status!='done'")
+        for res, kind, check, label, fields in queue:
+            con.execute("INSERT OR IGNORE INTO items(res, kind, check_res, label, fields) "
+                        "VALUES(?,?,?,?,?)", (res, kind, check, label, json.dumps(fields)))
         res = {"time": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
-               "campaigns": len(camps), "ad_groups": len(groups), "ads": len(ads),
-               "ad_types": types,
-               "campaigns_with_not_exactly_1_ad": sum(1 for v in per_camp.values() if v != 1),
-               "ad_groups_with_not_exactly_1_ad": sum(1 for v in per_ag.values() if v != 1),
-               "ads_with_more_than_1_final_url": multi,
-               "ads_to_update": len(queue),
-               "ads_with_old_path_in_another_form_not_changed": len(odd),
+               "campaigns": len(camps), "campaigns_by_type": camp_channels,
+               "ad_groups": len(groups), "ads": len(ads), "ad_types": types,
+               "ads_to_update": sum(1 for q in queue if q[1] == "ad"),
+               "ads_to_update_by_ad_type": q_types,
+               "ads_to_update_by_campaign_type": q_channels,
+               "assets_to_update": sum(1 for q in queue if q[1] == "asset"),
+               "assets_to_update_by_type": a_types,
+               "campaigns_with_more_than_1_ad": [[n, c] for n, c in not_one][:50],
+               "campaigns_with_no_ad": len(no_ads),
+               "campaign_names_with_old_path_not_changed": sum(
+                   1 for x in camps if config.has_old(x.campaign.name)),
                "keywords_with_old_url_not_changed": kw_old,
-               "assets_with_old_url_not_changed": asset_old,
-               "tracking_templates_or_suffixes_with_old_url_not_changed": tpl_old,
-               "sample_ads_to_update": [[n, u] for _, _, n, u, _ in queue[:5]],
-               "sample_other_form": odd[:5]}
-        db.kv_set(con, "scan", res)
+               "campaign_templates_with_old_url_not_changed": tpl_hits(camps, "campaign"),
+               "ad_group_templates_with_old_url_not_changed": tpl_hits(groups, "ad_group"),
+               "account_template_with_old_url_not_changed": tpl_hits(cust, "customer"),
+               "sample_changes": [[q[3], q[4]] for q in queue[:3]] +
+                                 [[q[3], q[4]] for q in queue if q[1] == "asset"][:3]}
+        db.kv_set(con, SCAN_KEY, res)
     w.write("Scan", [["Item", "Value"]] + [[k, v if isinstance(v, (int, str)) else json.dumps(v)]
                                            for k, v in res.items()])
-    w.log(f"scan (read-only): {json.dumps(res)[:1500]}")
+    w.log(f"scan (read-only): {json.dumps(res)[:3000]}")
     return res
 
 
-def update(w, cid):
+def _op(w, kind, res, fields):
+    op = w.client.get_type("AdOperation" if kind == "ad" else "AssetOperation")
+    op.update.resource_name = res
+    for f, (_, new) in fields.items():
+        if isinstance(new, list):
+            getattr(op.update, f).extend(new)
+        else:
+            setattr(op.update, f, new)
+        op.update_mask.paths.append(f)
+    return op
+
+
+def _read_back(w, cid, kind, checks):
+    out = {}
+    for chunk in _chunks(checks):
+        q = ",".join(_q(x) for x in chunk)
+        if kind == "ad":
+            rows = _search(w, cid, f"SELECT ad_group_ad.resource_name, {_sel('ad_group_ad.ad')} "
+                                   f"FROM ad_group_ad WHERE ad_group_ad.resource_name IN ({q})")
+            for x in rows:
+                out[x.ad_group_ad.resource_name] = _values(x.ad_group_ad.ad)
+        else:
+            rows = _search(w, cid, f"SELECT asset.resource_name, {_sel('asset')} FROM asset "
+                                   f"WHERE asset.resource_name IN ({q})")
+            for x in rows:
+                out[x.asset.resource_name] = _values(x.asset)
+    return out
+
+
+def _update_kind(w, cid, kind, budget):
     con = w.con
-    st = db.kv_get(con, "update", {})
-    if st.get("done"):
-        return
-    if not st.get("started"):
-        st = {"started": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
-        db.kv_set(con, "update", st)
-        w.log("update started")
-    todo = [dict(r) for r in con.execute(
-        "SELECT * FROM search_ads WHERE status='todo' AND attempts<3 ORDER BY ad_group_ad")]
-    if not todo:
-        st["done"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-        db.kv_set(con, "update", st)
-        report(w)
-        w.log("update finished")
-        return
-    left = w.quota_cap() - db.ops_last_24h(con) - config.QUOTA_RESERVE
-    part = todo[:max(0, min(left - 60, 1000))]           # 1 op per ad + read-backs
+    part = [dict(r) for r in con.execute(
+        "SELECT * FROM items WHERE kind=? AND status='todo' AND attempts<3 ORDER BY res LIMIT ?",
+        (kind, max(0, min(budget, 1000))))]
     if not part:
-        report(w)
-        return
-    ops = []
-    for r in part:
-        urls, mob = json.loads(r["urls"]), json.loads(r["mobile"])
-        op = w.client.get_type("AdOperation")
-        op.update.resource_name = r["ad"]
-        op.update.final_urls.extend([config.rewrite_url(u) for u in urls])
-        op.update_mask.paths.append("final_urls")
-        if _has_old(mob):
-            op.update.final_mobile_urls.extend([config.rewrite_url(u) for u in mob])
-            op.update_mask.paths.append("final_mobile_urls")
-        ops.append(op)
+        return 0
+    ops = [_op(w, kind, r["res"], json.loads(r["fields"])) for r in part]
     db.log_ops(con, len(ops), "update")
     try:
-        ad_svc = w.client.get_service("AdService")
-        resp = ad_svc.mutate_ads(request={
-            "customer_id": cid, "operations": ops, "partial_failure": True})
+        if kind == "ad":
+            svc = w.client.get_service("AdService")
+            resp = svc.mutate_ads(request={"customer_id": cid, "operations": ops,
+                                           "partial_failure": True})
+        else:
+            svc = w.client.get_service("AssetService")
+            resp = svc.mutate_assets(request={"customer_id": cid, "operations": ops,
+                                              "partial_failure": True})
     except Exception as e:
         if quota_kind(e):
             raise
         with db.tx(con):                          # whole request refused: counts as a try
             for r in part:
-                con.execute("UPDATE search_ads SET attempts=attempts+1, error=? WHERE "
-                            "ad_group_ad=?", (short(e, 500), r["ad_group_ad"]))
-        report(w)
+                con.execute("UPDATE items SET attempts=attempts+1, error=? WHERE res=?",
+                            (short(e, 500), r["res"]))
         raise
     failed = partial_failures(w.client, resp)
-    now = {}
-    for chunk in _chunks([r["ad_group_ad"] for r in part]):
-        q = ",".join(_q(x) for x in chunk)
-        for x in _search(w, cid, "SELECT ad_group_ad.resource_name, ad_group_ad.ad.final_urls, "
-                                 "ad_group_ad.ad.final_mobile_urls FROM ad_group_ad WHERE "
-                                 f"ad_group_ad.resource_name IN ({q})"):
-            now[x.ad_group_ad.resource_name] = (list(x.ad_group_ad.ad.final_urls),
-                                                list(x.ad_group_ad.ad.final_mobile_urls))
+    now = _read_back(w, cid, kind, [r["check_res"] for r in part])
     ok = bad = 0
     fails = []
     with db.tx(con):
         for j, r in enumerate(part):
-            urls, mob = json.loads(r["urls"]), json.loads(r["mobile"])
-            want_u = [config.rewrite_url(u) for u in urls]
-            want_m = [config.rewrite_url(u) for u in mob] if _has_old(mob) else None
-            got = now.get(r["ad_group_ad"])
-            if got is not None and got[0] == want_u and (want_m is None or got[1] == want_m):
+            fields = json.loads(r["fields"])
+            got = now.get(r["check_res"])
+            if got is not None and all(got.get(f) == new for f, (_, new) in fields.items()):
                 ok += 1
-                con.execute("UPDATE search_ads SET status='done', error=NULL WHERE ad_group_ad=?",
-                            (r["ad_group_ad"],))
+                con.execute("UPDATE items SET status='done', error=NULL WHERE res=?", (r["res"],))
             else:
                 bad += 1
-                err = failed.get(j) or failed.get(None) or f"Google Ads still shows {got}"
-                con.execute("UPDATE search_ads SET attempts=attempts+1, error=? WHERE "
-                            "ad_group_ad=?", (str(err)[:500], r["ad_group_ad"]))
-                fails.append(f"{short(r['campaign'], 80)}: {short(err, 200)}")
+                err = failed.get(j) or failed.get(None) or (
+                    "not found when read back" if got is None else
+                    f"Google Ads still shows {json.dumps({f: got.get(f) for f in fields})}")
+                con.execute("UPDATE items SET attempts=attempts+1, error=? WHERE res=?",
+                            (str(err)[:500], r["res"]))
+                fails.append(f"{short(r['label'], 80)}: {short(err, 200)}")
     for f in fails[:20]:
-        w.log(f"update FAILED: {f}")
-    w.log(f"update: {ok} ads now on the new URL (read back from Google Ads), {bad} not; "
-          f"{len(todo) - len(part)} left for later loops")
-    report(w)
+        w.log(f"update FAILED ({kind}): {f}")
+    w.log(f"update ({kind}s): {ok} now on the new URL (read back from Google Ads), {bad} not")
+    return len(part)
+
+
+def update(w, cid):
+    con = w.con
+    st = db.kv_get(con, UPDATE_KEY, {})
+    if st.get("done"):
+        return
+    if not st.get("started"):
+        st = {"started": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
+        db.kv_set(con, UPDATE_KEY, st)
+        w.log("update started")
+    left = con.execute("SELECT COUNT(*) FROM items WHERE status='todo' AND attempts<3"
+                       ).fetchone()[0]
+    if not left:
+        st["done"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        db.kv_set(con, UPDATE_KEY, st)
+        report(w)
+        w.log("update finished")
+        return
+    try:
+        for kind in ("ad", "asset"):
+            budget = w.quota_cap() - db.ops_last_24h(con) - config.QUOTA_RESERVE - 60
+            if budget <= 0:
+                break
+            if _update_kind(w, cid, kind, budget):
+                break                              # one batch per loop
+    finally:
+        report(w)
 
 
 def report(w):
     con = w.con
-    c = {r[0]: r[1] for r in con.execute("SELECT status, COUNT(*) FROM search_ads GROUP BY status")}
-    failed = con.execute("SELECT COUNT(*) FROM search_ads WHERE status='todo' AND attempts>=3"
-                         ).fetchone()[0]
-    st = db.kv_get(con, "update", {})
+    st = db.kv_get(con, UPDATE_KEY, {})
     rows = [["Item", "Value"], ["Started", st.get("started", "")],
-            ["Finished", st.get("done", "not yet")],
-            ["Ads updated (read back from Google Ads)", c.get("done", 0)],
-            ["Ads still to do", c.get("todo", 0) - failed],
-            ["Ads failed 3 times", failed],
-            ["Operations sent in the last 24 h (this tool)", db.ops_last_24h(con)],
-            ["", ""], ["Failed ad (campaign)", "Google's message"]]
-    rows += [[r["campaign"], r["error"]] for r in con.execute(
-        "SELECT campaign, error FROM search_ads WHERE status='todo' AND attempts>=3 LIMIT 500")]
+            ["Finished", st.get("done", "not yet")]]
+    for kind in ("ad", "asset"):
+        c = {r[0]: r[1] for r in con.execute(
+            "SELECT status, COUNT(*) FROM items WHERE kind=? GROUP BY status", (kind,))}
+        failed = con.execute("SELECT COUNT(*) FROM items WHERE kind=? AND status='todo' AND "
+                             "attempts>=3", (kind,)).fetchone()[0]
+        rows += [[f"{kind.title()}s updated (read back from Google Ads)", c.get("done", 0)],
+                 [f"{kind.title()}s still to do", c.get("todo", 0) - failed],
+                 [f"{kind.title()}s failed 3 times", failed]]
+    rows += [["Operations sent in the last 24 h (this tool)", db.ops_last_24h(con)],
+             ["", ""], ["Failed (campaign / asset)", "Google's message"]]
+    rows += [[r["label"], r["error"]] for r in con.execute(
+        "SELECT label, error FROM items WHERE status='todo' AND attempts>=3 LIMIT 500")]
     w.write("Update", rows)
 
 
@@ -228,7 +313,7 @@ def run(w):
     cid = account(w.settings)
     if not cid:
         return
-    if w.s_bool("Run scan") and not db.kv_get(w.con, "scan"):
+    if w.s_bool("Run scan") and not db.kv_get(w.con, SCAN_KEY):
         scan(w, cid)
-    if w.s_bool("Run update") and db.kv_get(w.con, "scan"):
+    if w.s_bool("Run update") and db.kv_get(w.con, SCAN_KEY):
         update(w, cid)
