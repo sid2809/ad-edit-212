@@ -317,3 +317,44 @@ def test_whole_request_refused_counts_as_a_try_and_stops_after_3(tmp):
         w.tick()
     assert len(calls) == 3
     assert all(r["attempts"] == 3 for r in w.con.execute("SELECT attempts FROM items"))
+
+
+def test_failing_scan_stops_after_3_tries_until_retoggled(tmp):
+    g = SearchAccount()
+    g.raise_on_search = RuntimeError("INVALID_QUERY")
+    w = worker(tmp, g, {"Account": CID, "Run scan": True})
+    calls = []
+    orig = g.search_stream
+
+    def counting(**k):
+        calls.append(1)
+        return orig(**k)
+    g.search_stream = counting
+    for _ in range(6):
+        w.tick()
+    assert len(calls) == 3
+    assert "Scan failed 3 times; stopped" in w.sheet.tabs["Scan"][1][0]
+    w.sheet.settings["Run scan"] = False
+    w.tick()
+    w.sheet.settings["Run scan"] = True
+    g.raise_on_search = None
+    w.tick()
+    assert db.kv_get(w.con, "scan_v2")["ads"] == 5
+
+
+def test_read_back_failure_counts_as_a_try(tmp):
+    g = SearchAccount()
+    w = worker(tmp, g, {"Account": CID, "Run scan": True})
+    w.tick()                                       # scan ok
+    orig = g.search_stream
+
+    def failing(**k):
+        if " IN (" in k["query"]:
+            raise RuntimeError("INTERNAL_ERROR")
+        return orig(**k)
+    g.search_stream = failing
+    w.sheet.settings["Run update"] = True
+    for _ in range(6):
+        w.tick()
+    assert g.mutations == 3
+    assert all(r["attempts"] == 3 for r in w.con.execute("SELECT attempts FROM items"))

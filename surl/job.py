@@ -237,7 +237,15 @@ def _update_kind(w, cid, kind, budget):
                             (short(e, 500), r["res"]))
         raise
     failed = partial_failures(w.client, resp)
-    now = _read_back(w, cid, kind, [r["check_res"] for r in part])
+    try:
+        now = _read_back(w, cid, kind, [r["check_res"] for r in part])
+    except Exception as e:
+        if not quota_kind(e):                     # read-back failed: counts as a try, so the
+            with db.tx(con):                      # same batch is not re-sent forever
+                for r in part:
+                    con.execute("UPDATE items SET attempts=attempts+1, error=? WHERE res=?",
+                                ("read-back failed: " + short(e, 480), r["res"]))
+        raise
     ok = bad = 0
     fails = []
     with db.tx(con):
@@ -309,11 +317,30 @@ def report(w):
     w.write("Update", rows)
 
 
+MAX_SCAN_FAILURES = 3
+
+
 def run(w):
     cid = account(w.settings)
     if not cid:
         return
-    if w.s_bool("Run scan") and not db.kv_get(w.con, SCAN_KEY):
-        scan(w, cid)
+    con = w.con
+    if not w.s_bool("Run scan"):
+        db.kv_set(con, "scan_failures", 0)        # untick + tick again = 3 more tries
+    elif not db.kv_get(con, SCAN_KEY):
+        n = db.kv_get(con, "scan_failures", 0)
+        if n >= MAX_SCAN_FAILURES:
+            return
+        try:
+            scan(w, cid)
+        except Exception as e:
+            if not quota_kind(e):
+                db.kv_set(con, "scan_failures", n + 1)
+                if n + 1 >= MAX_SCAN_FAILURES:
+                    w.write("Scan", [["Item", "Value"],
+                                     ["Scan failed 3 times; stopped", short(e, 400)],
+                                     ["To retry", "Set Run scan to FALSE, then TRUE"]])
+                    w.log("scan failed 3 times; stopped until Run scan is set FALSE then TRUE")
+            raise
     if w.s_bool("Run update") and db.kv_get(w.con, SCAN_KEY):
         update(w, cid)
