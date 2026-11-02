@@ -41,9 +41,13 @@ def _search(w, cid, query):
     db.log_ops(w.con, 1, "search")
     rows = []
     try:
-        for batch in w.client.get_service("GoogleAdsService").search_stream(
-                customer_id=cid, query=query):
+        # keep the service object alive while the stream is read; if it is garbage-collected
+        # mid-stream, gRPC cancels the call ("Stream removed (Channel deallocated!)")
+        svc = w.client.get_service("GoogleAdsService")
+        stream = svc.search_stream(customer_id=cid, query=query)
+        for batch in stream:
             rows.extend(batch.results)
+        del stream, svc
     except Exception as e:
         if quota_kind(e):
             raise QuotaExhausted(str(e)[:300]) from e
@@ -156,7 +160,8 @@ def update(w, cid):
         ops.append(op)
     db.log_ops(con, len(ops), "update")
     try:
-        resp = w.client.get_service("AdService").mutate_ads(request={
+        ad_svc = w.client.get_service("AdService")
+        resp = ad_svc.mutate_ads(request={
             "customer_id": cid, "operations": ops, "partial_failure": True})
     except Exception as e:
         if quota_kind(e):
